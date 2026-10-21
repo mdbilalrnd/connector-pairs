@@ -1,0 +1,9 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "game":    { ".read": true, ".write": true },
+    "players": { ".read": true, ".write": true },
+    "groups":  { ".read": true, ".write": true }
+  }
+}

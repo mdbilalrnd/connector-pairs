@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Connector Pairs Host</title>
+<meta name="robots" content="noindex">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Atkinson+Hyperlegible:wght@400;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap wide">
+  <header>
+    <h1>Connector <span>Pairs</span> · Host</h1>
+    <p class="sub">Put this page on the projector. Students scan the code, enter their names, and you start the quiz.</p>
+  </header>
+  <div id="gate" class="card" style="max-width:420px">
+    <h2>Enter host PIN</h2>
+    <input type="password" id="pin" inputmode="numeric" autocomplete="off" placeholder="PIN from config.js">
+    <button class="btn" id="pin-go">Open host controls</button>
+    <p class="note err" id="pin-err"></p>
+  </div>
+  <div class="grid2" id="main" hidden>
+    <div class="col">
+      <div class="card">
+        <h2>Scan to join</h2>
+        <div class="qr" id="qr" role="img" aria-label="QR code for the student quiz page"></div>
+        <p class="url" id="url"></p>
+      </div>
+      <div class="card host" id="controls"></div>
+    </div>
+    <div class="col">
+      <div class="card"><h2>Leaderboard</h2><ol class="lb" id="lb"></ol></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script src="config.js"></script>
+<script src="quiz.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const studentUrl = new URL("index.html", location.href).href.replace(/index\.html$/, "");
+let db, status = "lobby", players = {}, groups = {}, busy = false, confirmReset = false, errMsg = "";
+
+// PIN gate (keeps students out of the host controls; not real security)
+function unlock(){ $("#gate").hidden = true; $("#main").hidden = false; boot(); }
+try { if (sessionStorage.getItem("cp_host") === "1") unlock(); } catch (e) {}
+$("#pin-go").onclick = () => {
+  if ($("#pin").value.trim() === String(window.HOST_PIN)) { try { sessionStorage.setItem("cp_host", "1"); } catch (e) {} unlock(); }
+  else $("#pin-err").textContent = "Wrong PIN. Check HOST_PIN in config.js.";
+};
+$("#pin").onkeydown = e => { if (e.key === "Enter") $("#pin-go").click(); };
+
+function boot(){
+  $("#url").textContent = studentUrl;
+  try { const q = qrcode(0, "M"); q.addData(studentUrl); q.make(); $("#qr").innerHTML = q.createSvgTag({ cellSize: 8, margin: 2, scalable: true }); }
+  catch (e) { $("#qr").textContent = "QR code couldn't load. Share the link below."; }
+  if (!configReady()) { $("#controls").replaceChildren(el("h2",{text:"Setup not finished"}),el("p",{class:"why",text:"Paste your Firebase settings into config.js (README step 2), then upload it again."})); return; }
+  firebase.initializeApp(FIREBASE_CONFIG);
+  db = firebase.database();
+  db.ref("game/status").on("value", s => { status = s.val() || "lobby"; renderControls(); });
+  db.ref("players").on("value", s => { players = s.val() || {}; renderControls(); }, () => { errMsg = "Can't read the database. Check the database rules (README step 3)."; renderControls(); });
+  db.ref("groups").on("value", s => { groups = s.val() || {}; renderBoard($("#lb"), groups, null); renderControls(); });
+}
+
+const list = () => Object.entries(players).map(([id, p]) => ({ id, ...p })).sort((a, b) => a.t - b.t);
+
+function addGroupUpdates(updates, grs){
+  for (const g of grs) {
+    const id = db.ref("groups").push().key;
+    const members = {}, names = {};
+    g.forEach(p => { members[p.id] = true; names[p.id] = p.name; updates[`players/${p.id}/group`] = id; });
+    updates[`groups/${id}`] = { members, names, createdAt: Date.now() };
+  }
+}
+async function start(){
+  const waiting = list().filter(p => !p.group);
+  const updates = {};
+  addGroupUpdates(updates, makeGroups(waiting).groups);
+  updates["game/status"] = "running";
+  await db.ref().update(updates);
+}
+async function pairLate(){
+  const waiting = list().filter(p => !p.group);
+  const updates = {};
+  if (waiting.length >= 2) addGroupUpdates(updates, makeGroups(waiting).groups);
+  else if (waiting.length === 1) {
+    const p = waiting[0];
+    const target = Object.entries(groups).filter(([, g]) => membersOf(g).length > 1)
+      .sort(([, a], [, b]) => membersOf(a).length - membersOf(b).length || (a.createdAt || 0) - (b.createdAt || 0))[0];
+    if (!target) return;
+    updates[`groups/${target[0]}/members/${p.id}`] = true;
+    updates[`groups/${target[0]}/names/${p.id}`] = p.name;
+    updates[`players/${p.id}/group`] = target[0];
+  }
+  await db.ref().update(updates);
+}
+async function resetAll(){ await db.ref().update({ players: null, groups: null, "game/status": "lobby" }); }
+
+function run(btn, label, fn){
+  return async () => {
+    if (busy) return; busy = true; btn.disabled = true; btn.textContent = label;
+    try { await fn(); errMsg = ""; } catch (e) { errMsg = "That didn't go through. Check the internet and the database rules."; }
+    busy = false; confirmReset = false; renderControls();
+  };
+}
+
+function renderControls(){
+  const box = $("#controls"); if (!db) return;
+  const ps = list(), running = status === "running", unpaired = ps.filter(p => !p.group);
+  const kids = [el("p",{class:"eyebrow",text:"Host controls"})];
+  if (!running) {
+    kids.push(el("div",{class:"row",style:"align-items:baseline;gap:8px"},el("span",{class:"count",text:String(ps.length)}),el("span",{class:"note",text:"students have entered"})));
+    kids.push(el("div",{class:"plist"},...ps.map(p => el("span",{class:"chip"},document.createTextNode(p.name),
+      el("button",{title:"Remove " + p.name,"aria-label":"Remove " + p.name,text:"×",onclick:()=>db.ref("players/" + p.id).remove()})))));
+    const n = ps.length, odd = n % 2 === 1 && n >= 3, k = Math.floor(n / 2);
+    kids.push(el("p",{class:"note",text:n < 2 ? "At least 2 students are needed to start." : `This makes ${k} random ${k === 1 ? "group" : "groups"}${odd ? " (one group of three, so nobody is alone)" : ""}.`}));
+    const b = el("button",{class:"btn gold",text:"Start quiz & make pairs"}); b.disabled = n < 2 || busy;
+    b.onclick = run(b, "Pairing…", start); kids.push(b);
+  } else {
+    const gcount = Object.values(groups).filter(g => membersOf(g).length > 1).length;
+    kids.push(el("div",{class:"status good",text:`Quiz is live · ${gcount} ${gcount === 1 ? "group" : "groups"} playing`}));
+    if (unpaired.length) {
+      kids.push(el("p",{class:"note",text:`${unpaired.length} late ${unpaired.length === 1 ? "student is" : "students are"} waiting: ${unpaired.map(p => p.name).join(", ")}.`}));
+      const b = el("button",{class:"btn gold",text:unpaired.length === 1 ? "Add to a group" : "Pair late students"});
+      b.disabled = busy || (unpaired.length === 1 && !gcount); b.onclick = run(b, "Pairing…", pairLate); kids.push(b);
+    }
+  }
+  if (errMsg) kids.push(el("p",{class:"note err",text:errMsg}));
+  if (!confirmReset) kids.push(el("button",{class:"btn danger",text:"Reset everything",onclick:()=>{confirmReset=true;renderControls()}}));
+  else {
+    const y = el("button",{class:"btn danger",text:"Yes, reset"}); y.onclick = run(y, "Resetting…", resetAll);
+    kids.push(el("div",{class:"confirm"},el("p",{class:"note",text:"This deletes all names, groups and scores. Everyone will have to enter again."}),
+      el("div",{class:"row"},el("button",{class:"btn ghost",text:"Cancel",onclick:()=>{confirmReset=false;renderControls()}}),y)));
+  }
+  box.replaceChildren(...kids);
+}
+</script>
+</body>
+</html>

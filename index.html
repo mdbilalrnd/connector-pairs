@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Connector Pairs</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Atkinson+Hyperlegible:wght@400;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Connector <span>Pairs</span></h1>
+    <p class="sub">Answer with a partner. A point counts only when your <b>whole pair</b> picks the right connector.</p>
+  </header>
+  <div class="tabs" role="tablist">
+    <button id="tab-play" role="tab" aria-selected="true">Play</button>
+    <button id="tab-board" role="tab" aria-selected="false">Leaderboard</button>
+  </div>
+  <section id="view-play"><div class="card" id="play"><p class="note">Loading…</p></div></section>
+  <section id="view-board" hidden><div class="card"><h2>Leaderboard</h2><ol class="lb" id="lb"></ol></div></section>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="config.js"></script>
+<script src="quiz.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const play = $("#play");
+function store(k,v){try{v===undefined?localStorage.removeItem(k):localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
+function load(k){try{return JSON.parse(localStorage.getItem(k))}catch(e){return null}}
+const dots = () => el("span",{class:"dots"},el("i"),el("i"),el("i"));
+function tab(w){$("#tab-play").setAttribute("aria-selected",w==="play");$("#tab-board").setAttribute("aria-selected",w==="board");$("#view-play").hidden=w!=="play";$("#view-board").hidden=w!=="board"}
+$("#tab-play").onclick=()=>tab("play"); $("#tab-board").onclick=()=>tab("board");
+
+// Each phone gets its own random id, kept in this browser.
+let pid = load("cp_pid");
+if (!pid) { pid = "p" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36); store("cp_pid", pid); }
+
+let db, status = "lobby", players = {}, me = null, hadMe = false, leaving = false, joinMsg = "";
+let groups = {}, gid = null, viewing = 0, picked = null, busy = false, screen = "";
+
+if (!configReady()) {
+  play.replaceChildren(el("h2",{text:"Setup not finished"}),el("p",{class:"why",text:"The host still needs to paste the Firebase settings into config.js. See README.md."}));
+} else {
+  firebase.initializeApp(FIREBASE_CONFIG);
+  db = firebase.database();
+  db.ref("game/status").on("value", s => { status = s.val() || "lobby"; render(); });
+  db.ref("players").on("value", s => {
+    players = s.val() || {};
+    const mine = players[pid] || null;
+    if (hadMe && !mine) { joinMsg = leaving ? "" : "You were removed or the game was reset. Enter your name again."; leaving = false; screen = ""; }
+    hadMe = !!mine; me = mine;
+    const g = me && me.group || null;
+    if (g !== gid) { gid = g; viewing = g ? (load("cp_view_" + g) || 0) : 0; picked = null; }
+    render();
+  }, () => offline());
+  db.ref("groups").on("value", s => { groups = s.val() || {}; renderBoard($("#lb"), groups, gid); render(); });
+}
+function offline(){ play.replaceChildren(el("p",{class:"note err",text:"Can't reach the quiz database. Check your internet, or ask the host to check the database rules."})); }
+
+function render(){
+  if (!db) return;
+  if (!me) return joinScreen();
+  screen = "";
+  const g = gid && groups[gid];
+  if (!g) return lobbyScreen();
+  questionScreen(g);
+}
+
+function joinScreen(){
+  if (screen === "join") return; screen = "join";
+  const inp = el("input",{type:"text",id:"nick",maxlength:"24",placeholder:"e.g. Bilal",autocomplete:"off"});
+  inp.value = load("cp_name") || "";
+  const err = el("p",{class:"note err",text:joinMsg});
+  const go = el("button",{class:"btn",text:"Enter the quiz"});
+  const submit = async () => {
+    const n = inp.value.trim(); if (!n) { inp.focus(); return; }
+    go.disabled = true; go.textContent = "Entering…"; store("cp_name", n); joinMsg = "";
+    try { await db.ref("players/" + pid).set({ name: n, t: Date.now() }); }
+    catch (e) { go.disabled = false; go.textContent = "Enter the quiz"; err.textContent = "Couldn't join. Check your internet and try again."; }
+  };
+  go.onclick = submit; inp.onkeydown = e => { if (e.key === "Enter") submit(); };
+  play.replaceChildren(
+    el("h2",{text:"Enter your name"}),
+    el("ol",{class:"rules"},
+      el("li",{text:"Type your name and wait. When the host starts, you'll be paired with a random classmate."}),
+      el("li",{text:`${QS.length} questions on linking words like nevertheless, moreover and hence.`}),
+      el("li",{text:`Your pair earns ${PTS} points only when every partner answers correctly.`}),
+      el("li",{text:"No talking to your partner. You only see their answer after you both lock in."})),
+    el("label",{for:"nick",text:"Your name"}), inp, go, err);
+}
+
+function lobbyScreen(){
+  const list = Object.entries(players).map(([id,p])=>({id,...p})).sort((a,b)=>a.t-b.t);
+  const started = status === "running";
+  play.replaceChildren(
+    el("p",{class:"eyebrow",text:"You're in"}),
+    el("h2",{class:"q",text:`Hi ${me.name}!`}),
+    el("div",{class:"status wait"},document.createTextNode(started?"The quiz has started. The host will pair you in a moment":"Waiting for the host to start the quiz"),dots()),
+    el("div",{class:"row",style:"align-items:baseline;gap:8px"},el("span",{class:"count",text:String(list.length)}),el("span",{class:"note",text:"students have entered"})),
+    el("div",{class:"plist"},...list.map(p=>el("span",{class:"chip",text:p.name+(p.id===pid?" (you)":"")}))),
+    !started && el("button",{class:"btn ghost",text:"Change my name",onclick:async()=>{leaving=true;try{await db.ref("players/"+pid).remove()}catch(e){leaving=false}}}));
+}
+
+function questionScreen(g){
+  const members = membersOf(g), others = members.filter(u => u !== pid);
+  const nm = u => (g.names || {})[u] || "Partner";
+  const ans = g.ans || {};
+  const { score } = scoreOf(g);
+  if (viewing >= QS.length) return finishScreen(g);
+  const i = viewing, q = QS[i], key = "q" + i;
+  const myAns = (ans[pid] || {})[key];
+  const waitingOn = others.filter(u => (ans[u] || {})[key] == null);
+  const all = myAns != null && waitingOn.length === 0;
+  const parts = q.s.split("___");
+  const opts = el("div",{class:"opts"});
+  q.o.forEach((o,k) => {
+    let cls = "opt";
+    if (all) { if (k === q.a) cls += " right"; else if (k === myAns) cls += " wrong"; }
+    else if (k === (myAns ?? picked)) cls += " picked";
+    const b = el("button",{class:cls,text:o}); b.disabled = myAns != null || busy;
+    b.onclick = () => answer(i, k); opts.append(b);
+  });
+  let st = null, why = null, next = null;
+  if (myAns != null && !all) st = el("div",{class:"status wait"},document.createTextNode(`Locked in. Waiting for ${waitingOn.map(nm).join(" & ")}`),dots());
+  if (all) {
+    const wrong = members.filter(u => (ans[u] || {})[key] !== q.a);
+    let msg;
+    if (!wrong.length) msg = `Everyone got it! +${PTS} points`;
+    else if (wrong.length === members.length) msg = "Nobody got this one. No points.";
+    else msg = wrong.map(u => `${u === pid ? "You" : nm(u)} picked "${q.o[(ans[u] || {})[key]]}"`).join(", ") + ". No points.";
+    st = el("div",{class:"status " + (wrong.length ? "bad" : "good"),text:msg});
+    why = el("p",{class:"why",text:`${q.o[q.a]}: ${q.w}`});
+    next = el("button",{class:"btn",text:i === QS.length - 1 ? "See final score" : "Next question",onclick:()=>{viewing=i+1;picked=null;store("cp_view_"+gid,viewing);render()}});
+  }
+  play.replaceChildren(
+    el("div",{class:"pairline"},el("span",{class:"chip",text:nm(pid)}),document.createTextNode(others.length>1?"in a group with":"paired with"),el("span",{class:"chip",text:others.map(nm).join(" & ")}),el("span",{style:"margin-left:auto;font-weight:700;color:var(--ink)",text:`${score} pts`})),
+    el("div",{class:"prog"},el("span",{text:`Question ${i+1} of ${QS.length}`}),el("span",{text:"Pick the best connector"})),
+    el("div",{class:"bar"},el("i",{style:`width:${(i/QS.length)*100}%`})),
+    el("p",{class:"q"},document.createTextNode(parts[0]),el("span",{class:"blank",text:all?q.o[q.a]:" "}),document.createTextNode(parts[1]||"")),
+    opts, st, why, next);
+}
+
+async function answer(i, k){
+  if (busy) return; busy = true; picked = k; render();
+  try { await db.ref(`groups/${gid}/ans/${pid}/q${i}`).set(k); } catch (e) { picked = null; }
+  busy = false; render();
+}
+
+function finishScreen(g){
+  const { score } = scoreOf(g);
+  const pos = ranked(groups).findIndex(r => r.id === gid) + 1;
+  play.replaceChildren(
+    el("h2",{class:"q",text:"Quiz complete!"}),
+    el("div",{class:"big",text:String(score)}),
+    el("p",{class:"why",text:`points out of ${QS.length*PTS} for ${namesOf(g).join(" & ")}${pos?` · currently #${pos}`:""}`}),
+    el("button",{class:"btn",text:"View leaderboard",onclick:()=>tab("board")}));
+}
+</script>
+</body>
+</html>
